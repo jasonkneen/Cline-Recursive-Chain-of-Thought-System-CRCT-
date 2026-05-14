@@ -487,6 +487,16 @@ def command_handler_analyze_project(args: argparse.Namespace) -> int:
                 "Project analysis completed successfully. Results not saved to file (use --output)."
             )
 
+        # --- Automatically Reconcile Transparency ---
+        # The user wants this to run near the end of an analyze-project run.
+        try:
+            logger.info(
+                "Automatically reconciling documentation transparency markers..."
+            )
+            reconcile_transparency_in_path(abs_project_root, transform="remove")
+        except Exception as e:
+            logger.error(f"Failed to automatically reconcile transparency: {e}")
+
         return (
             0
             if results.get("status") == "success" or results.get("status") == "warning"
@@ -1989,7 +1999,7 @@ def handle_resolve_placeholders(args: argparse.Namespace) -> int:
     if not hasattr(args, "_processed_pairs"):
         args._processed_pairs = set()
     if not hasattr(args, "accumulated_tracker_updates"):
-        args.accumulated_tracker_updates = []
+        setattr(args, "accumulated_tracker_updates", [])
 
     _raw_pairs = getattr(args, "_processed_pairs")
     processed_pairs = cast(Set[Tuple[str, str, str, str]], _raw_pairs)
@@ -2366,7 +2376,9 @@ def handle_resolve_placeholders(args: argparse.Namespace) -> int:
         # Commit all algorithmic updates at once, passing accumulated_updates
         global_collector.commit_all(
             skip_populate_hook=True,
-            accumulated_updates=cast(List[Any], args.accumulated_tracker_updates),
+            accumulated_updates=cast(
+                List[Any], getattr(args, "accumulated_tracker_updates", [])
+            ),
         )
         logger.info(
             f"Global Algorithmic/Shortcut phase complete in {time.time()-algo_start_time:.2f}s"
@@ -2399,7 +2411,7 @@ def handle_resolve_placeholders(args: argparse.Namespace) -> int:
         if not key_def_pairs or not grid_rows_data:
             continue
 
-        found_llm_tasks = []
+        found_llm_tasks: List[Tuple[str, str, str, str]] = []
         for row_idx, (row_label, compressed_row) in enumerate(grid_rows_data):
             if focus_key and row_label != focus_key:
                 continue
@@ -2543,7 +2555,9 @@ def handle_resolve_placeholders(args: argparse.Namespace) -> int:
         global_map=global_map,
         tracker_type=tracker_type,
         prepare_func=_identity_prepare,
-        accumulated_updates=cast(List[Any], args.accumulated_tracker_updates),
+        accumulated_updates=cast(
+            List[Any], getattr(args, "accumulated_tracker_updates", [])
+        ),
     )
 
     args.limit -= total_processed
@@ -2554,6 +2568,178 @@ def handle_resolve_placeholders(args: argparse.Namespace) -> int:
 
     processor.close()
     return 0
+
+
+def reconcile_transparency_in_path(
+    scan_path: str, transform: Optional[str] = None
+) -> int:
+    """
+    Internal helper to scan files for documentation markers and reconcile them.
+    Used by both the standalone command and the automated analysis flow.
+    """
+    from cline_utils.dependency_system.io.transparency_manager import (
+        get_transparency_manager,
+    )
+
+    manager = get_transparency_manager()
+    project_root = get_project_root()
+
+    # Identify files to scan
+    all_files: List[str] = []
+
+    if os.path.isfile(scan_path):
+        all_files.append(scan_path)
+    elif os.path.isdir(scan_path):
+        for root, dirs, files in os.walk(scan_path):
+            # Skip common hidden/build dirs
+            dirs[:] = [
+                d
+                for d in dirs
+                if not d.startswith(".")
+                and d not in ("node_modules", "venv", "__pycache__")
+            ]
+            for f in files:
+                if f.endswith((".md", ".txt", ".rst")):
+                    all_files.append(os.path.join(root, f))
+
+    if not all_files:
+        logger.debug(f"No documentation files found to scan in {scan_path}.")
+        return 0
+
+    reconciled_count = 0
+    for file_path in all_files:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            # Find markers and calculate shifts
+            sections: Dict[str, Tuple[int, int]] = {}
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("---") and stripped.endswith("_START---"):
+                    section_name = stripped[3:-9]
+                    # Find end
+                    for j in range(i + 1, len(lines)):
+                        if lines[j].strip() == f"---{section_name}_END---":
+                            sections[section_name] = (i, j)
+                            break
+
+            if not sections:
+                continue
+
+            # If transform is 'remove', we need to calculate the "clean" content and new line numbers
+            if transform == "remove":
+                # 1. Identify ALL indices to remove
+                indices_to_remove: Set[int] = set()
+                for i, j in sections.values():
+                    indices_to_remove.add(i)  # Start marker
+                    indices_to_remove.add(j)  # End marker
+
+                # Special handling for TAGS: also remove the content between markers
+                tags_content = None
+                if "TAGS" in sections:
+                    s_idx, e_idx = sections["TAGS"]
+                    for idx in range(s_idx + 1, e_idx):
+                        indices_to_remove.add(idx)
+                    tags_content = "".join(lines[s_idx + 1 : e_idx]).strip()
+
+                # 2. Calculate new content
+                sorted_remove: List[int] = sorted(list(indices_to_remove))
+                new_lines = [
+                    l for i, l in enumerate(lines) if i not in indices_to_remove
+                ]
+                new_content = "".join(new_lines)
+
+                # 3. Calculate adjusted sections
+                adjusted_sections: Dict[str, Any] = {}
+                for name, pos in sections.items():
+                    if name == "TAGS":
+                        # Store as virtual content
+                        adjusted_sections[name] = {"content": tags_content}
+                    else:
+                        start_idx, end_idx = pos
+                        # Formula: new_index = old_index - count(removed indices < old_index)
+                        markers_before_content_start = sum(
+                            1 for m in sorted_remove if m < start_idx + 1
+                        )
+                        markers_before_content_end = sum(
+                            1 for m in sorted_remove if m < end_idx - 1
+                        )
+
+                        new_start_idx = (start_idx + 1) - markers_before_content_start
+                        new_end_idx = (end_idx - 1) - markers_before_content_end
+
+                        # Store 1-indexed for the registry
+                        adjusted_sections[name] = [new_start_idx + 1, new_end_idx + 1]
+
+                # Update registry with CLEAN content checksum and ADJUSTED line numbers
+                manager.update_file_metadata(file_path, adjusted_sections, new_content)
+
+                # Write back the clean content to the file
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+
+                logger.debug(
+                    f"  [REMOVED MARKERS] {os.path.relpath(file_path, project_root)}: {len(sections)} sections registered (TAGS virtualized)."
+                )
+
+            elif transform == "html":
+                # Convert to HTML comments
+                new_lines = list(lines)
+                for name, (start_idx, end_idx) in sections.items():
+                    new_lines[start_idx] = f"<!-- ---{name}_START--- -->\n"
+                    new_lines[end_idx] = f"<!-- ---{name}_END--- -->\n"
+
+                content = "".join(new_lines)
+                # Register with markers present (but commented out)
+                registry_sections: Dict[str, Tuple[int, int]] = {
+                    name: (start_idx + 1, end_idx + 1)
+                    for name, (start_idx, end_idx) in sections.items()
+                }
+                manager.update_file_metadata(file_path, registry_sections, content)
+
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+
+                logger.info(
+                    f"  [HTML COMMENTS] {os.path.relpath(file_path, project_root)}: {len(sections)} sections registered."
+                )
+
+            else:
+                # Just register with current markers
+                content = "".join(lines)
+                registry_sections: Dict[str, Tuple[int, int]] = {
+                    name: (start_idx + 1, end_idx + 1)
+                    for name, (start_idx, end_idx) in sections.items()
+                }
+                manager.update_file_metadata(file_path, registry_sections, content)
+                logger.info(
+                    f"  [REGISTERED] {os.path.relpath(file_path, project_root)}: {len(sections)} sections found."
+                )
+
+            reconciled_count += 1
+
+        except Exception as e:
+            logger.error(f"Error processing {file_path}: {e}", exc_info=True)
+
+    if reconciled_count > 0:
+        logger.info(
+            f"Successfully reconciled transparency for {reconciled_count} files."
+        )
+
+    # Cleanup stale entries for missing files
+    manager.cleanup_missing_files()
+
+    return 0
+
+
+def handle_reconcile_transparency(args: argparse.Namespace) -> int:
+    """
+    Scans files for documentation markers and reconciles them with the transparency registry.
+    """
+    project_root = get_project_root()
+    scan_path = args.path if args.path else project_root
+    return reconcile_transparency_in_path(scan_path, transform=args.transform)
 
 
 def main():
@@ -2808,6 +2994,21 @@ def main():
     )
     determine_dep_parser.set_defaults(func=handle_determine_dependency)
 
+    # --- Reconcile Transparency Command ---
+    reconcile_parser = subparsers.add_parser(
+        "reconcile-transparency",
+        help="Reconcile documentation markers with the transparency registry",
+    )
+    reconcile_parser.add_argument(
+        "--path", help="Path to file or directory to scan (default: project root)"
+    )
+    reconcile_parser.add_argument(
+        "--transform",
+        choices=["html", "remove"],
+        help="Transform markers: 'html' (convert to comments) or 'remove' (delete)",
+    )
+    reconcile_parser.set_defaults(func=handle_reconcile_transparency)
+
     args = parser.parse_args()
 
     # --- Setup Logging ---
@@ -2895,7 +3096,10 @@ def main():
         if args.func == handle_resolve_placeholders and hasattr(
             args, "accumulated_tracker_updates"
         ):
-            if args.accumulated_tracker_updates:
+            accumulated_updates = cast(
+                List[Dict[str, Any]], args.accumulated_tracker_updates
+            )
+            if accumulated_updates:
                 from cline_utils.dependency_system.utils.populate_comments import (
                     populate_comments_for_batch,
                     report_batch_results,
@@ -2914,7 +3118,7 @@ def main():
                 try:
                     results = populate_comments_for_batch(
                         project_root=Path(get_project_root_cached()),
-                        updates=args.accumulated_tracker_updates,
+                        updates=accumulated_updates,
                         symbol_map=load_project_symbol_map(),
                         dry_run=False,
                         verbose=False,
@@ -2923,7 +3127,7 @@ def main():
                         report_batch_results(results, dry_run=False)
                 except Exception as e:
                     logger.error(f"Error in final populate_comments hook: {e}")
-                args.accumulated_tracker_updates.clear()
+                accumulated_updates.clear()
 
         sys.exit(exit_code)
     else:

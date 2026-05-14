@@ -545,6 +545,7 @@ All project specific documentation (any items in a doc root directory) MUST foll
 * **Mandatory Conversion**: If you encounter a documentation file that does not follow this format, you must convert it as your first action relative to that file. **CRITICAL: Ensure all original data is preserved during conversion.**
 * **New Content**: All newly generated documentation must use the structured template from the start.
 * **Tagging**: Follow the `---TAGS_START---` section guidelines in the template, utilizing flat JSONB-style tags for optimal classification.
+* **Transparency Awareness**: Markers may be virtualized in the transparency layer to keep source files clean. If a file appears to lack markers, check `cline_utils/dependency_system/core/transparency_registry.json` before assuming it needs conversion.
 
 ## XIII. Mandatory Update Protocol (MUP) on Significant Progress
 
